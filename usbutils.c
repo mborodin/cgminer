@@ -1356,6 +1356,20 @@ static void release_cgpu(struct cgpu_info *cgpu)
 }
 
 /*
+ * Force a NODEV on a device so it goes back to hotplug
+ */
+void usb_nodev(struct cgpu_info *cgpu)
+{
+	int pstate;
+
+	DEVWLOCK(cgpu, pstate);
+
+	release_cgpu(cgpu);
+
+	DEVWUNLOCK(cgpu, pstate);
+}
+
+/*
  * Use the same usbdev thus locking is across all related devices
  */
 struct cgpu_info *usb_copy_cgpu(struct cgpu_info *orig)
@@ -2495,14 +2509,14 @@ int _usb_read(struct cgpu_info *cgpu, int intinfo, int epinfo, char *buf, size_t
 				cgtimer_t now, already_done;
 				double sleep_estimate;
 				double write_time = (double)(usbdev->last_write_siz) /
-						    (double)(usbdev->cps);
+						    (double)(usbdev->cps) * 1000;
 
 				cgtimer_time(&now);
 				cgtimer_sub(&now, &usbdev->cgt_last_write, &already_done);
 				sleep_estimate = write_time - cgtimer_to_ms(&already_done);
 
 				if (sleep_estimate > 0.0) {
-					cgsleep_ms_r(&usbdev->cgt_last_write, write_time * 1000.0);
+					cgsleep_ms_r(&usbdev->cgt_last_write, write_time);
 					cgpu->usbinfo.read_delay_count++;
 					cgpu->usbinfo.total_read_delay += sleep_estimate;
 				}
@@ -2596,14 +2610,14 @@ int _usb_read(struct cgpu_info *cgpu, int intinfo, int epinfo, char *buf, size_t
 			cgtimer_t now, already_done;
 			double sleep_estimate;
 			double write_time = (double)(usbdev->last_write_siz) /
-					    (double)(usbdev->cps);
+					    (double)(usbdev->cps) * 1000;
 
 			cgtimer_time(&now);
 			cgtimer_sub(&now, &usbdev->cgt_last_write, &already_done);
 			sleep_estimate = write_time - cgtimer_to_ms(&already_done);
 
 			if (sleep_estimate > 0.0) {
-				cgsleep_ms_r(&usbdev->cgt_last_write, write_time * 1000.0);
+				cgsleep_ms_r(&usbdev->cgt_last_write, write_time);
 				cgpu->usbinfo.read_delay_count++;
 				cgpu->usbinfo.total_read_delay += sleep_estimate;
 			}
@@ -2743,14 +2757,14 @@ int _usb_write(struct cgpu_info *cgpu, int intinfo, int epinfo, char *buf, size_
 				cgtimer_t now, already_done;
 				double sleep_estimate;
 				double write_time = (double)(usbdev->last_write_siz) /
-						    (double)(usbdev->cps);
+						    (double)(usbdev->cps) * 1000;
 
 				cgtimer_time(&now);
 				cgtimer_sub(&now, &usbdev->cgt_last_write, &already_done);
 				sleep_estimate = write_time - cgtimer_to_ms(&already_done);
 
 				if (sleep_estimate > 0.0) {
-					cgsleep_ms_r(&usbdev->cgt_last_write, write_time * 1000.0);
+					cgsleep_ms_r(&usbdev->cgt_last_write, write_time);
 					cgpu->usbinfo.write_delay_count++;
 					cgpu->usbinfo.total_write_delay += sleep_estimate;
 				}
@@ -2882,14 +2896,14 @@ int __usb_transfer(struct cgpu_info *cgpu, uint8_t request_type, uint8_t bReques
 			cgtimer_t now, already_done;
 			double sleep_estimate;
 			double write_time = (double)(usbdev->last_write_siz) /
-					    (double)(usbdev->cps);
+					    (double)(usbdev->cps) * 1000;
 
 			cgtimer_time(&now);
 			cgtimer_sub(&now, &usbdev->cgt_last_write, &already_done);
 			sleep_estimate = write_time - cgtimer_to_ms(&already_done);
 
 			if (sleep_estimate > 0.0) {
-				cgsleep_ms_r(&usbdev->cgt_last_write, write_time * 1000.0);
+				cgsleep_ms_r(&usbdev->cgt_last_write, write_time);
 				cgpu->usbinfo.write_delay_count++;
 				cgpu->usbinfo.total_write_delay += sleep_estimate;
 			}
@@ -2964,14 +2978,14 @@ int _usb_transfer_read(struct cgpu_info *cgpu, uint8_t request_type, uint8_t bRe
 		cgtimer_t now, already_done;
 		double sleep_estimate;
 		double write_time = (double)(usbdev->last_write_siz) /
-				    (double)(usbdev->cps);
+				    (double)(usbdev->cps) * 1000;
 
 		cgtimer_time(&now);
 		cgtimer_sub(&now, &usbdev->cgt_last_write, &already_done);
 		sleep_estimate = write_time - cgtimer_to_ms(&already_done);
 
 		if (sleep_estimate > 0.0) {
-			cgsleep_ms_r(&usbdev->cgt_last_write, write_time * 1000.0);
+			cgsleep_ms_r(&usbdev->cgt_last_write, write_time);
 			cgpu->usbinfo.read_delay_count++;
 			cgpu->usbinfo.total_read_delay += sleep_estimate;
 		}
