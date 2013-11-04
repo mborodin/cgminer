@@ -59,13 +59,17 @@ endif
 
 endif
 
-
 if NEED_FPGAUTILS
 cgminer_SOURCES += fpgautils.c fpgautils.h
 endif
 
 if WANT_USBUTILS
 cgminer_SOURCES += usbutils.c usbutils.h
+endif
+
+# Device drivers
+if HAS_AVALON
+cgminer_SOURCES += driver-avalon.c driver-avalon.h
 endif
 
 if HAS_KNC
@@ -80,16 +84,16 @@ if HAS_BITFORCE
 cgminer_SOURCES += driver-bitforce.c
 endif
 
+if HAS_HASHFAST
+cgminer_SOURCES += driver-hashfast.c driver-hashfast.h hf_protocol.h
+endif
+
 if HAS_BITFURY
 cgminer_SOURCES += driver-bitfury.c driver-bitfury.h
 endif
 
 if HAS_ICARUS
 cgminer_SOURCES += driver-icarus.c
-endif
-
-if HAS_AVALON
-cgminer_SOURCES += driver-avalon.c driver-avalon.h
 endif
 
 if HAS_KLONDIKE

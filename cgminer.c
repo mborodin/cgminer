@@ -62,6 +62,12 @@ char *curly = ":D";
 #include "usbutils.h"
 #endif
 
+#if defined(unix) || defined(__APPLE__)
+	#include <errno.h>
+	#include <fcntl.h>
+	#include <sys/wait.h>
+#endif
+
 #ifdef USE_AVALON
 #include "driver-avalon.h"
 #endif
@@ -70,10 +76,8 @@ char *curly = ":D";
 #include "driver-bflsc.h"
 #endif
 
-#if defined(unix) || defined(__APPLE__)
-	#include <errno.h>
-	#include <fcntl.h>
-	#include <sys/wait.h>
+#ifdef USE_HASHFAST
+#include "driver-hashfast.h"
 #endif
 
 #if defined(USE_BITFORCE) || defined(USE_ICARUS) || defined(USE_AVALON) || defined(USE_MODMINER)
@@ -272,11 +276,10 @@ const
 #endif
 bool curses_active;
 
-static char current_block[40];
-
 /* Protected by ch_lock */
-static char *current_hash;
-char *current_fullhash;
+char current_hash[68];
+static char prev_block[12];
+static char current_block[32];
 
 static char datestamp[40];
 static char blocktime[32];
@@ -287,7 +290,7 @@ static char block_diff[8];
 uint64_t best_diff = 0;
 
 struct block {
-	char hash[40];
+	char hash[68];
 	UT_hash_handle hh;
 	int block_no;
 };
@@ -1270,7 +1273,7 @@ static struct opt_table opt_config_table[] = {
 #ifdef USE_KLONDIKE
 	OPT_WITH_ARG("--klondike-options",
 		     set_klondike_options, NULL, NULL,
-		     "Set klondike options clock:temp1:temp2:fan"),
+		     "Set klondike options clock:temptarget"),
 #endif
 	OPT_WITHOUT_ARG("--load-balance",
 		     set_loadbalance, &pool_strategy,
@@ -1594,9 +1597,6 @@ extern const char *opt_argv0;
 static char *opt_verusage_and_exit(const char *extra)
 {
 	printf("%s\nBuilt with "
-#ifdef USE_KNC
-		"KnC "
-#endif
 #ifdef USE_AVALON
 		"avalon "
 #endif
@@ -1612,11 +1612,17 @@ static char *opt_verusage_and_exit(const char *extra)
 #ifdef HAVE_OPENCL
 		"GPU "
 #endif
+#ifdef USE_HASHFAST
+		"hashfast "
+#endif
 #ifdef USE_ICARUS
 		"icarus "
 #endif
 #ifdef USE_KLONDIKE
 		"klondike "
+#endif
+#ifdef USE_KNC
+		"KnC "
 #endif
 #ifdef USE_MODMINER
 		"modminer "
@@ -1748,7 +1754,7 @@ void free_work(struct work *work)
 }
 
 static void gen_hash(unsigned char *data, unsigned char *hash, int len);
-static void calc_diff(struct work *work, int known);
+static void calc_diff(struct work *work, double known);
 char *workpadding = "000000800000000000000000000000000000000000000000000000000000000000000000000000000000000080020000";
 
 #ifdef HAVE_LIBCURL
@@ -2267,6 +2273,11 @@ static void get_statline(char *buf, size_t bufsiz, struct cgpu_info *cgpu)
 	wprintw(win, "%s", tmp42); \
 } while (0)
 
+static bool shared_strategy(void)
+{
+	return (pool_strategy == POOL_LOADBALANCE || pool_strategy == POOL_BALANCE);
+}
+
 /* Must be called with curses mutex lock held and curses_active */
 static void curses_print_status(void)
 {
@@ -2282,7 +2293,7 @@ static void curses_print_status(void)
 		total_staged(), total_stale, new_blocks,
 		local_work, total_go, total_ro);
 	wclrtoeol(statuswin);
-	if ((pool_strategy == POOL_LOADBALANCE  || pool_strategy == POOL_BALANCE) && total_pools > 1) {
+	if (shared_strategy() && total_pools > 1) {
 		cg_mvwprintw(statuswin, 4, 0, " Connected to multiple pools with%s block change notify",
 			have_longpoll ? "": "out");
 	} else if (pool->has_stratum) {
@@ -2295,7 +2306,7 @@ static void curses_print_status(void)
 	}
 	wclrtoeol(statuswin);
 	cg_mvwprintw(statuswin, 5, 0, " Block: %s...  Diff:%s  Started: %s  Best share: %s   ",
-		  current_hash, block_diff, blocktime, best_share);
+		     prev_block, block_diff, blocktime, best_share);
 	mvwhline(statuswin, 6, 0, '-', 80);
 	mvwhline(statuswin, statusy - 1, 0, '-', 80);
 	cg_mvwprintw(statuswin, devcursor - 1, 1, "[P]ool management %s[S]ettings [D]isplay options [Q]uit",
@@ -2703,6 +2714,27 @@ static void print_status(int thr_id)
 		text_print_status(thr_id);
 }
 
+static void show_hash(struct work *work, char *hashshow)
+{
+	unsigned char rhash[32];
+	char diffdisp[16];
+	unsigned long h32;
+	uint32_t *hash32;
+	int intdiff, ofs;
+
+	swab256(rhash, work->hash);
+	for (ofs = 0; ofs <= 28; ofs ++) {
+		if (rhash[ofs])
+			break;
+	}
+	hash32 = (uint32_t *)(rhash + ofs);
+	h32 = be32toh(*hash32);
+	intdiff = round(work->work_difficulty);
+	suffix_string(work->share_diff, diffdisp, sizeof (diffdisp), 0);
+	snprintf(hashshow, 64, "%08lx Diff %s/%d%s", h32, diffdisp, intdiff,
+		 work->block? " BLOCK!" : "");
+}
+
 static bool submit_upstream_work(struct work *work, CURL *curl, bool resubmit)
 {
 	char *hexstr = NULL;
@@ -2796,20 +2828,7 @@ static bool submit_upstream_work(struct work *work, CURL *curl, bool resubmit)
 	err = json_object_get(val, "error");
 
 	if (!QUIET) {
-		int intdiff = floor(work->work_difficulty);
-		char diffdisp[16], *outhash;
-		unsigned char rhash[32];
-
-		swab256(rhash, work->hash);
-		if (opt_scrypt)
-			outhash = bin2hex(rhash + 2, 4);
-		else
-			outhash = bin2hex(rhash + 4, 4);
-		suffix_string(work->share_diff, diffdisp, sizeof(diffdisp), 0);
-		snprintf(hashshow, sizeof(hashshow), "%s Diff %s/%d%s",
-				outhash, diffdisp, intdiff,
-				work->block? " BLOCK!" : "");
-		free(outhash);
+		show_hash(work, hashshow);
 
 		if (opt_worktime) {
 			char workclone[20];
@@ -3060,43 +3079,62 @@ out:
 	return pool;
 }
 
-static double DIFFEXACTONE = 26959946667150639794667015087019630673637144422540572481103610249215.0;
-static const uint64_t diffone = 0xFFFF000000000000ull;
+/* truediffone == 0x00000000FFFF0000000000000000000000000000000000000000000000000000
+ * Generate a 256 bit binary LE target by cutting up diff into 64 bit sized
+ * portions or vice versa. */
+static const double truediffone = 26959535291011309493156476344723991336010898738574164086137773096960.0;
+static const double bits192 = 6277101735386680763835789423207666416102355444464034512896.0;
+static const double bits128 = 340282366920938463463374607431768211456.0;
+static const double bits64 = 18446744073709551616.0;
+
+/* Converts a little endian 256 bit value to a double */
+static double le256todouble(const void *target)
+{
+	uint64_t *data64;
+	double dcut64;
+
+	data64 = (uint64_t *)(target + 24);
+	dcut64 = le64toh(*data64) * bits192;
+
+	data64 = (uint64_t *)(target + 16);
+	dcut64 += le64toh(*data64) * bits128;
+
+	data64 = (uint64_t *)(target + 8);
+	dcut64 += le64toh(*data64) * bits64;
+
+	data64 = (uint64_t *)(target);
+	dcut64 += le64toh(*data64);
+
+	return dcut64;
+}
 
 /*
- * Calculate the work share difficulty
+ * Calculate the work->work_difficulty based on the work->target
  */
-static void calc_diff(struct work *work, int known)
+static void calc_diff(struct work *work, double known)
 {
 	struct cgminer_pool_stats *pool_stats = &(work->pool->cgminer_pool_stats);
 	double difficulty;
+	int intdiff;
 
-	if (opt_scrypt) {
-		uint64_t *data64, d64;
-		char rtarget[32];
-
-		swab256(rtarget, work->target);
-		data64 = (uint64_t *)(rtarget + 2);
-		d64 = be64toh(*data64);
-		if (unlikely(!d64))
-			d64 = 1;
-		work->work_difficulty = diffone / d64;
-	} else if (!known) {
-		double targ = 0;
-		int i;
-
-		for (i = 31; i >= 0; i--) {
-			targ *= 256;
-			targ += work->target[i];
-		}
-
-		work->work_difficulty = DIFFEXACTONE / (targ ? : DIFFEXACTONE);
-	} else
+	if (known)
 		work->work_difficulty = known;
+	else {
+		double d64, dcut64;
+
+		d64 = truediffone;
+		if (opt_scrypt)
+			d64 *= (double)65536;
+		dcut64 = le256todouble(work->target);
+		if (unlikely(!dcut64))
+			dcut64 = 1;
+		work->work_difficulty = d64 / dcut64;
+	}
 	difficulty = work->work_difficulty;
 
 	pool_stats->last_diff = difficulty;
-	suffix_string((uint64_t)difficulty, work->pool->diff, sizeof(work->pool->diff), 0);
+	intdiff = round(difficulty);
+	suffix_string(intdiff, work->pool->diff, sizeof(work->pool->diff), 0);
 
 	if (difficulty == pool_stats->min_diff)
 		pool_stats->min_diff_count++;
@@ -3143,9 +3181,22 @@ static void disable_curses_windows(void)
 	delwin(statuswin);
 }
 
+/* Force locking of curses console_lock on shutdown since a dead thread might
+ * have grabbed the lock. */
+static bool curses_active_forcelocked(void)
+{
+	bool ret;
+
+	mutex_trylock(&console_lock);
+	ret = curses_active;
+	if (!ret)
+		unlock_curses();
+	return ret;
+}
+
 static void disable_curses(void)
 {
-	if (curses_active_locked()) {
+	if (curses_active_forcelocked()) {
 		use_curses = false;
 		curses_active = false;
 		disable_curses_windows();
@@ -3609,12 +3660,14 @@ static void _copy_work(struct work *work, const struct work *base_work, int noff
 }
 
 /* Generates a copy of an existing work struct, creating fresh heap allocations
- * for all dynamically allocated arrays within the struct */
-struct work *copy_work(struct work *base_work)
+ * for all dynamically allocated arrays within the struct. noffset is used for
+ * when a driver has internally rolled the ntime, noffset is a relative value.
+ * The macro copy_work() calls this function with an noffset of 0. */
+struct work *copy_work_noffset(struct work *base_work, int noffset)
 {
 	struct work *work = make_work();
 
-	_copy_work(work, base_work, 0);
+	_copy_work(work, base_work, noffset);
 
 	return work;
 }
@@ -3701,19 +3754,18 @@ static bool stale_work(struct work *work, bool share)
 
 static uint64_t share_diff(const struct work *work)
 {
-	uint64_t *data64, d64, ret;
 	bool new_best = false;
-	char rhash[32];
+	double d64, s64;
+	uint64_t ret;
 
-	swab256(rhash, work->hash);
+	d64 = truediffone;
 	if (opt_scrypt)
-		data64 = (uint64_t *)(rhash + 2);
-	else
-		data64 = (uint64_t *)(rhash + 4);
-	d64 = be64toh(*data64);
-	if (unlikely(!d64))
-		d64 = 1;
-	ret = diffone / d64;
+		d64 *= (double)65536;
+	s64 = le256todouble(work->hash);
+	if (unlikely(!s64))
+		s64 = 0;
+
+	ret = round(d64 / s64);
 
 	cg_wlock(&control_lock);
 	if (unlikely(ret > best_diff)) {
@@ -3870,8 +3922,11 @@ void switch_pools(struct pool *selected)
 void discard_work(struct work *work)
 {
 	if (!work->clone && !work->rolls && !work->mined) {
-		if (work->pool)
+		if (work->pool) {
 			work->pool->discarded_work++;
+			work->pool->quota_used--;
+			work->pool->works--;
+		}
 		total_discarded++;
 		applog(LOG_DEBUG, "Discarded work");
 	} else
@@ -3934,9 +3989,12 @@ int restart_wait(struct thr_info *thr, unsigned int mstime)
 	return rc;
 }
 	
+static void flush_queue(struct cgpu_info *cgpu);
+
 static void restart_threads(void)
 {
 	struct pool *cp = current_pool();
+	struct cgpu_info *cgpu;
 	int i;
 
 	/* Artificially set the lagging flag to avoid pool not providing work
@@ -3947,8 +4005,12 @@ static void restart_threads(void)
 	discard_stale();
 
 	rd_lock(&mining_thr_lock);
-	for (i = 0; i < mining_threads; i++)
+	for (i = 0; i < mining_threads; i++) {
+		cgpu = mining_thr[i]->cgpu;
 		mining_thr[i]->work_restart = true;
+		flush_queue(cgpu);
+		cgpu->drv->flush_work(cgpu);
+	}
 	rd_unlock(&mining_thr_lock);
 
 	mutex_lock(&restart_lock);
@@ -3975,23 +4037,23 @@ static void signal_work_update(void)
 	rd_unlock(&mining_thr_lock);
 }
 
-static void set_curblock(char *hexstr, unsigned char *hash)
+static void set_curblock(char *hexstr, unsigned char *bedata)
 {
-	unsigned char hash_swap[32];
-	unsigned char block_hash_swap[32];
-
-	strcpy(current_block, hexstr);
-	swap256(hash_swap, hash);
-	swap256(block_hash_swap, hash + 4);
+	int ofs;
 
 	cg_wlock(&ch_lock);
 	cgtime(&block_timeval);
-	free(current_hash);
-	current_hash = bin2hex(hash_swap + 2, 8);
-	free(current_fullhash);
-	current_fullhash = bin2hex(block_hash_swap, 32);
+	strcpy(current_hash, hexstr);
+	memcpy(current_block, bedata, 32);
 	get_timestamp(blocktime, sizeof(blocktime), &block_timeval);
 	cg_wunlock(&ch_lock);
+
+	for (ofs = 0; ofs <= 56; ofs++) {
+		if (memcmp(&current_hash[ofs], "0", 1))
+			break;
+	}
+	strncpy(prev_block, &current_hash[ofs], 8);
+	prev_block[8] = '\0';
 
 	applog(LOG_INFO, "New block: %s... diff %s", current_hash, block_diff);
 }
@@ -4044,23 +4106,22 @@ static void set_blockdiff(const struct work *work)
 
 static bool test_work_current(struct work *work)
 {
+	struct pool *pool = work->pool;
+	unsigned char bedata[32];
+	char hexstr[68];
 	bool ret = true;
-	char hexstr[40];
 
 	if (work->mandatory)
 		return ret;
 
-	/* Hack to work around dud work sneaking into test */
-	__bin2hex(hexstr, work->data + 8, 18);
-	if (!strncmp(hexstr, "000000000000000000000000000000000000", 36))
-		return ret;
+	swap256(bedata, work->data + 4);
+	__bin2hex(hexstr, bedata, 32);
 
 	/* Search to see if this block exists yet and if not, consider it a
 	 * new block and set the current block details to this one */
 	if (!block_exists(hexstr)) {
 		struct block *s = calloc(sizeof(struct block), 1);
 		int deleted_block = 0;
-		ret = false;
 
 		if (unlikely(!s))
 			quit (1, "test_work_current OOM");
@@ -4086,31 +4147,71 @@ static bool test_work_current(struct work *work)
 
 		if (deleted_block)
 			applog(LOG_DEBUG, "Deleted block %d from database", deleted_block);
-		set_curblock(hexstr, work->data);
-		if (unlikely(new_blocks == 1))
-			return ret;
+		set_curblock(hexstr, bedata);
+		/* Copy the information to this pool's prev_block since it
+		 * knows the new block exists. */
+		memcpy(pool->prev_block, bedata, 32);
+		if (unlikely(new_blocks == 1)) {
+			ret = false;
+			goto out;
+		}
 
 		work->work_block = ++work_block;
 
-		if (!work->stratum) {
-			if (work->longpoll) {
+		if (work->longpoll) {
+			if (work->stratum) {
+				applog(LOG_NOTICE, "Stratum from pool %d detected new block",
+				       pool->pool_no);
+			} else {
 				applog(LOG_NOTICE, "%sLONGPOLL from pool %d detected new block",
 				       work->gbt ? "GBT " : "", work->pool->pool_no);
-			} else if (have_longpoll)
-				applog(LOG_NOTICE, "New block detected on network before longpoll");
-			else
-				applog(LOG_NOTICE, "New block detected on network");
-		}
+			}
+		} else if (have_longpoll)
+			applog(LOG_NOTICE, "New block detected on network before longpoll");
+		else
+			applog(LOG_NOTICE, "New block detected on network");
 		restart_threads();
-	} else if (work->longpoll) {
-		work->work_block = ++work_block;
-		if (work->pool == current_pool()) {
-			applog(LOG_NOTICE, "%sLONGPOLL from pool %d requested work restart",
-			       work->gbt ? "GBT " : "", work->pool->pool_no);
-			restart_threads();
+	} else {
+		if (memcmp(pool->prev_block, bedata, 32)) {
+			/* Work doesn't match what this pool has stored as
+			 * prev_block. Let's see if the work is from an old
+			 * block or the pool is just learning about a new
+			 * block. */
+			if (memcmp(bedata, current_block, 32)) {
+				/* Doesn't match current block. It's stale */
+				applog(LOG_DEBUG, "Stale data from pool %d", pool->pool_no);
+				ret = false;
+			} else {
+				/* Work is from new block and pool is up now
+				 * current. */
+				applog(LOG_INFO, "Pool %d now up to date", pool->pool_no);
+				memcpy(pool->prev_block, bedata, 32);
+			}
+		}
+#if 0
+		/* This isn't ideal, this pool is still on an old block but
+		 * accepting shares from it. To maintain fair work distribution
+		 * we work on it anyway. */
+		if (memcmp(bedata, current_block, 32))
+			applog(LOG_DEBUG, "Pool %d still on old block", pool->pool_no);
+#endif
+		if (work->longpoll) {
+			work->work_block = ++work_block;
+			if (shared_strategy() || work->pool == current_pool()) {
+				if (work->stratum) {
+					applog(LOG_NOTICE, "Stratum from pool %d requested work restart",
+					       pool->pool_no);
+				} else {
+					applog(LOG_NOTICE, "%sLONGPOLL from pool %d requested work restart",
+					       work->gbt ? "GBT " : "", work->pool->pool_no);
+				}
+				restart_threads();
+			}
 		}
 	}
+out:
 	work->longpoll = false;
+
 	return ret;
 }
 
@@ -4183,6 +4284,7 @@ static void stage_work(struct work *work)
 	applog(LOG_DEBUG, "Pushing work from pool %d to hash queue", work->pool->pool_no);
 	work->work_block = work_block;
 	test_work_current(work);
+	work->pool->works++;
 	hash_push(work);
 }
 
@@ -4226,6 +4328,7 @@ static void display_pool_summary(struct pool *pool)
 		if (!pool_localgen(pool))
 			wlog(" Efficiency (accepted / queued): %.0f%%\n", efficiency);
 
+		wlog(" Items worked on: %d\n", pool->works);
 		wlog(" Discarded work due to new blocks: %d\n", pool->discarded_work);
 		wlog(" Stale submissions discarded due to new blocks: %d\n", pool->stale_shares);
 		wlog(" Unable to get work from server occasions: %d\n", pool->getfail_occasions);
@@ -5149,16 +5252,8 @@ static void stratum_share_result(json_t *val, json_t *res_val, json_t *err_val,
 {
 	struct work *work = sshare->work;
 	char hashshow[64];
-	uint32_t *hash32;
-	char diffdisp[16];
-	int intdiff;
 
-	hash32 = (uint32_t *)(work->hash);
-	intdiff = floor(work->work_difficulty);
-	suffix_string(work->share_diff, diffdisp, sizeof (diffdisp), 0);
-	snprintf(hashshow, sizeof(hashshow),
-		"%08lx Diff %s/%d%s", (unsigned long)htole32(hash32[6]), diffdisp, intdiff,
-		work->block? " BLOCK!" : "");
+	show_hash(work, hashshow);
 	share_result(val, res_val, err_val, work, hashshow, false, "");
 }
 
@@ -5471,15 +5566,10 @@ static void *stratum_rthread(void *userdata)
 			 * block database */
 			pool->swork.clean = false;
 			gen_stratum_work(pool, work);
-			if (test_work_current(work)) {
-				/* Only accept a work restart if this stratum
-				 * connection is from the current pool */
-				if (pool == current_pool()) {
-					restart_threads();
-					applog(LOG_NOTICE, "Stratum from pool %d requested work restart", pool->pool_no);
-				}
-			} else
-				applog(LOG_NOTICE, "Stratum from pool %d detected new block", pool->pool_no);
+			work->longpoll = true;
+			/* Return value doesn't matter. We're just informing
+			 * that we may need to restart. */
+			test_work_current(work);
 			free_work(work);
 		}
 	}
@@ -5838,24 +5928,22 @@ static struct work *hash_pop(void)
 
 	mutex_lock(stgd_lock);
 	while (!HASH_COUNT(staged_work)) {
-		if (!no_work) {
-			struct timespec then;
-			struct timeval now;
-			int rc;
+		struct timespec then;
+		struct timeval now;
+		int rc;
 
-			cgtime(&now);
-			then.tv_sec = now.tv_sec + 10;
-			then.tv_nsec = now.tv_usec * 1000;
-			rc = pthread_cond_timedwait(&getq->cond, stgd_lock, &then);
-			/* Check again for !no_work as multiple threads may be
-			 * waiting on this condition and another may set the
-			 * bool separately. */
-			if (rc && !no_work) {
-				no_work = true;
-				applog(LOG_WARNING, "Waiting for work to be available from pools.");
-			}
-		} else
-			pthread_cond_wait(&getq->cond, stgd_lock);
+		cgtime(&now);
+		then.tv_sec = now.tv_sec + 10;
+		then.tv_nsec = now.tv_usec * 1000;
+		pthread_cond_signal(&gws_cond);
+		rc = pthread_cond_timedwait(&getq->cond, stgd_lock, &then);
+		/* Check again for !no_work as multiple threads may be
+			* waiting on this condition and another may set the
+			* bool separately. */
+		if (rc && !no_work) {
+			no_work = true;
+			applog(LOG_WARNING, "Waiting for work to be available from pools.");
+		}
 	}
 
 	if (no_work) {
@@ -5896,21 +5984,48 @@ static void gen_hash(unsigned char *data, unsigned char *hash, int len)
 
 void set_target(unsigned char *dest_target, double diff)
 {
-	unsigned char target[32], rtarget[32];
+	unsigned char target[32];
 	uint64_t *data64, h64;
-	double d64;
+	double d64, dcut64;
 
+	if (unlikely(diff == 0.0)) {
+		/* This shouldn't happen but best we check to prevent a crash */
+		applog(LOG_ERR, "Diff zero passed to set_target");
+		diff = 1.0;
+	}
+
+	d64 = truediffone;
 	if (opt_scrypt)
-		d64 = 0xFFFF00000000ull;
-	else
-		d64 = 0xFFFF0000ull;
+		d64 *= (double)65536;
 	d64 /= diff;
-	h64 = d64;
 
-	memset(rtarget, 0xFF, 32);
-	data64 = (uint64_t *)rtarget;
-	*data64 = htobe64(h64);
-	swab256(target, rtarget);
+	dcut64 = d64 / bits192;
+	h64 = dcut64;
+	data64 = (uint64_t *)(target + 24);
+	*data64 = htole64(h64);
+	dcut64 = h64;
+	dcut64 *= bits192;
+	d64 -= dcut64;
+
+	dcut64 = d64 / bits128;
+	h64 = dcut64;
+	data64 = (uint64_t *)(target + 16);
+	*data64 = htole64(h64);
+	dcut64 = h64;
+	dcut64 *= bits128;
+	d64 -= dcut64;
+
+	dcut64 = d64 / bits64;
+	h64 = dcut64;
+	data64 = (uint64_t *)(target + 8);
+	*data64 = htole64(h64);
+	dcut64 = h64;
+	dcut64 *= bits64;
+	d64 -= dcut64;
+
+	h64 = d64;
+	data64 = (uint64_t *)(target);
+	*data64 = htole64(h64);
 
 	if (opt_debug) {
 		char *htarget = bin2hex(target, 32);
@@ -6075,20 +6190,38 @@ void inc_hw_errors(struct thr_info *thr)
 	thr->cgpu->drv->hw_error(thr);
 }
 
-bool test_nonce(struct work *work, uint32_t nonce)
+/* Fills in the work nonce and builds the output data in work->hash */
+static void rebuild_nonce(struct work *work, uint32_t nonce)
 {
 	uint32_t *work_nonce = (uint32_t *)(work->data + 64 + 12);
-	uint32_t *hash2_32 = (uint32_t *)work->hash2;
-	uint32_t diff1targ;
 
 	*work_nonce = htole32(nonce);
 
-	/* Do one last check before attempting to submit the work */
 	rebuild_hash(work);
-	flip32(hash2_32, work->hash);
+}
 
+/* For testing a nonce against diff 1 */
+bool test_nonce(struct work *work, uint32_t nonce)
+{
+	uint32_t *hash_32 = (uint32_t *)(work->hash + 28);
+	uint32_t diff1targ;
+
+	rebuild_nonce(work, nonce);
 	diff1targ = opt_scrypt ? 0x0000ffffUL : 0;
-	return (be32toh(hash2_32[7]) <= diff1targ);
+
+	return (le32toh(*hash_32) <= diff1targ);
+}
+
+/* For testing a nonce against an arbitrary diff */
+bool test_nonce_diff(struct work *work, uint32_t nonce, double diff)
+{
+	uint64_t *hash64 = (uint64_t *)(work->hash + 24), diff64;
+
+	rebuild_nonce(work, nonce);
+	diff64 = opt_scrypt ? 0x0000ffff00000000ULL : 0x00000000ffff0000ULL;
+	diff64 /= diff;
+
+	return (le64toh(*hash64) <= diff64);
 }
 
 static void update_work_stats(struct thr_info *thr, struct work *work)
@@ -6118,8 +6251,8 @@ void submit_tested_work(struct thr_info *thr, struct work *work)
 	struct work *work_out;
 	update_work_stats(thr, work);
 
-	if (!fulltest(work->hash2, work->target)) {
-		applog(LOG_INFO, "Share below target");
+	if (!fulltest(work->hash, work->target)) {
+		applog(LOG_INFO, "Share above target");
 		return;
 	}
 	work_out = copy_work(work);
@@ -6156,8 +6289,8 @@ bool submit_noffset_nonce(struct thr_info *thr, struct work *work_in, uint32_t n
 	}
 	ret = true;
 	update_work_stats(thr, work);
-	if (!fulltest(work->hash2, work->target)) {
-		applog(LOG_INFO, "Share below target");
+	if (!fulltest(work->hash, work->target)) {
+		applog(LOG_INFO, "Share above target");
 		goto  out;
 	}
 	submit_work_async(work);
@@ -6530,10 +6663,7 @@ void hash_queued_work(struct thr_info *mythr)
 		if (unlikely(mythr->pause || cgpu->deven != DEV_ENABLED))
 			mt_disable(mythr, thr_id, drv);
 
-		if (unlikely(mythr->work_restart)) {
-			flush_queue(cgpu);
-			drv->flush_work(cgpu);
-		} else if (mythr->work_update)
+		if (mythr->work_update)
 			drv->update_work(cgpu);
 	}
 	cgpu->deven = DEV_DISABLED;
@@ -6580,9 +6710,7 @@ void hash_driver_work(struct thr_info *mythr)
 		if (unlikely(mythr->pause || cgpu->deven != DEV_ENABLED))
 			mt_disable(mythr, thr_id, drv);
 
-		if (unlikely(mythr->work_restart))
-			drv->flush_work(cgpu);
-		else if (mythr->work_update)
+		if (mythr->work_update)
 			drv->update_work(cgpu);
 	}
 	cgpu->deven = DEV_DISABLED;
@@ -7202,6 +7330,7 @@ void print_summary(void)
 			if (pool->accepted || pool->rejected)
 				applog(LOG_WARNING, " Reject ratio: %.1f%%", (double)(pool->rejected * 100) / (double)(pool->accepted + pool->rejected));
 
+			applog(LOG_WARNING, " Items worked on: %d", pool->works);
 			applog(LOG_WARNING, " Stale submissions discarded due to new blocks: %d", pool->stale_shares);
 			applog(LOG_WARNING, " Unable to get work from server occasions: %d", pool->getfail_occasions);
 			applog(LOG_WARNING, " Submitting work remotely delay occasions: %d\n", pool->remotefail_occasions);
@@ -7243,15 +7372,11 @@ static void clean_up(bool restarting)
 #ifdef WIN32
 	timeEndPeriod(1);
 #endif
-	if (!restarting) {
-		/* Attempting to disable curses or print a summary during a
-		 * restart can lead to a deadlock. */
 #ifdef HAVE_CURSES
-		disable_curses();
+	disable_curses();
 #endif
-		if (!opt_realquiet && successful_connect)
-			print_summary();
-	}
+	if (!restarting && !opt_realquiet && successful_connect)
+		print_summary();
 
 	curl_global_cleanup();
 }
@@ -7930,7 +8055,7 @@ int main(int argc, char *argv[])
 	for (i = 0; i < 36; i++)
 		strcat(block->hash, "0");
 	HASH_ADD_STR(blocks, hash, block);
-	strcpy(current_block, block->hash);
+	strcpy(current_hash, block->hash);
 
 	INIT_LIST_HEAD(&scan_devices);
 

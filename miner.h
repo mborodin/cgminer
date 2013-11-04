@@ -173,7 +173,9 @@ static inline int fsync (int fd)
 # if __BYTE_ORDER == __LITTLE_ENDIAN
 #  define htole16(x) (x)
 #  define htole32(x) (x)
+#  define htole64(x) (x)
 #  define le32toh(x) (x)
+#  define le64toh(x) (x)
 #  define be32toh(x) bswap_32(x)
 #  define be64toh(x) bswap_64(x)
 #  define htobe32(x) bswap_32(x)
@@ -182,6 +184,8 @@ static inline int fsync (int fd)
 #  define htole16(x) bswap_16(x)
 #  define htole32(x) bswap_32(x)
 #  define le32toh(x) bswap_32(x)
+#  define le64toh(x) bswap_64(x)
+#  define htole64(x) bswap_64(x)
 #  define be32toh(x) (x)
 #  define be64toh(x) (x)
 #  define htobe32(x) (x)
@@ -242,9 +246,10 @@ static inline int fsync (int fd)
 #define ASIC_PARSE_COMMANDS(DRIVER_ADD_COMMAND) \
 	DRIVER_ADD_COMMAND(bflsc) \
 	DRIVER_ADD_COMMAND(bitfury) \
+	DRIVER_ADD_COMMAND(hashfast) \
+	DRIVER_ADD_COMMAND(klondike) \
 	DRIVER_ADD_COMMAND(knc) \
-	DRIVER_ADD_COMMAND(avalon) \
-	DRIVER_ADD_COMMAND(klondike)
+	DRIVER_ADD_COMMAND(avalon)
 
 #define DRIVER_PARSE_COMMANDS(DRIVER_ADD_COMMAND) \
 	DRIVER_ADD_COMMAND(opencl) \
@@ -1182,7 +1187,7 @@ extern unsigned int total_go, total_ro;
 extern const int opt_cutofftemp;
 extern int opt_log_interval;
 extern unsigned long long global_hashrate;
-extern char *current_fullhash;
+extern char current_hash[68];
 extern double current_diff;
 extern uint64_t best_diff;
 extern struct timeval block_timeval;
@@ -1266,6 +1271,7 @@ struct pool {
 	int quota;
 	int quota_gcd;
 	int quota_used;
+	int works;
 
 	double diff_accepted;
 	double diff_rejected;
@@ -1320,6 +1326,9 @@ struct pool {
 
 	struct cgminer_stats cgminer_stats;
 	struct cgminer_pool_stats cgminer_pool_stats;
+
+	/* The last block this particular pool knows about */
+	char prev_block[32];
 
 	/* Stratum variables */
 	char *stratum_url;
@@ -1392,7 +1401,6 @@ struct work {
 #endif
 	double		device_diff;
 	uint64_t	share_diff;
-	unsigned char	hash2[32];
 
 	int		rolls;
 	int		drv_rolllimit; /* How much the driver can roll ntime */
@@ -1489,6 +1497,7 @@ struct modminer_fpga_state {
 extern void get_datestamp(char *, size_t, struct timeval *);
 extern void inc_hw_errors(struct thr_info *thr);
 extern bool test_nonce(struct work *work, uint32_t nonce);
+extern bool test_nonce_diff(struct work *work, uint32_t nonce, double diff);
 extern void submit_tested_work(struct thr_info *thr, struct work *work);
 extern bool submit_nonce(struct thr_info *thr, struct work *work, uint32_t nonce);
 extern bool submit_noffset_nonce(struct thr_info *thr, struct work *work, uint32_t nonce,
@@ -1530,7 +1539,8 @@ extern void adl(void);
 extern void app_restart(void);
 extern void clean_work(struct work *work);
 extern void free_work(struct work *work);
-extern struct work *copy_work(struct work *base_work);
+extern struct work *copy_work_noffset(struct work *base_work, int noffset);
+#define copy_work(work_in) copy_work_noffset(work_in, 0)
 extern struct thr_info *get_thread(int thr_id);
 extern struct cgpu_info *get_devices(int id);
 
@@ -1538,6 +1548,8 @@ enum api_data_type {
 	API_ESCAPE,
 	API_STRING,
 	API_CONST,
+	API_UINT8,
+	API_UINT16,
 	API_INT,
 	API_UINT,
 	API_UINT32,
@@ -1570,6 +1582,8 @@ struct api_data {
 extern struct api_data *api_add_escape(struct api_data *root, char *name, char *data, bool copy_data);
 extern struct api_data *api_add_string(struct api_data *root, char *name, char *data, bool copy_data);
 extern struct api_data *api_add_const(struct api_data *root, char *name, const char *data, bool copy_data);
+extern struct api_data *api_add_uint8(struct api_data *root, char *name, uint8_t *data, bool copy_data);
+extern struct api_data *api_add_uint16(struct api_data *root, char *name, uint16_t *data, bool copy_data);
 extern struct api_data *api_add_int(struct api_data *root, char *name, int *data, bool copy_data);
 extern struct api_data *api_add_uint(struct api_data *root, char *name, unsigned int *data, bool copy_data);
 extern struct api_data *api_add_uint32(struct api_data *root, char *name, uint32_t *data, bool copy_data);
