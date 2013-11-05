@@ -20,15 +20,13 @@
 
 #define NODEV(err) ((err) == LIBUSB_ERROR_NO_DEVICE || \
 			(err) == LIBUSB_ERROR_PIPE || \
-			(err) == LIBUSB_ERROR_OTHER || \
-			(err) == LIBUSB_TRANSFER_NO_DEVICE || \
-			(err) == LIBUSB_TRANSFER_STALL || \
-			(err) == LIBUSB_TRANSFER_ERROR)
+			(err) == LIBUSB_ERROR_OTHER)
+
+/* Timeout errors on writes are basically unrecoverable */
+#define WRITENODEV(err) ((err) == LIBUSB_ERROR_TIMEOUT || NODEV(err))
 
 #define NOCONTROLDEV(err) ((err) == LIBUSB_ERROR_NO_DEVICE || \
-			(err) == LIBUSB_ERROR_OTHER || \
-			(err) == LIBUSB_TRANSFER_NO_DEVICE || \
-			(err) == LIBUSB_TRANSFER_ERROR)
+			(err) == LIBUSB_ERROR_OTHER)
 
 /*
  * WARNING - these assume DEVLOCK(cgpu, pstate) is called first and
@@ -68,6 +66,10 @@
 #define KLONDIKE_TIMEOUT_MS 999
 #define ICARUS_TIMEOUT_MS 999
 #define HASHFAST_TIMEOUT_MS 999
+
+/* The safety timeout we use, cancelling async transfers on windows that fail
+ * to timeout on their own. */
+#define WIN_CALLBACK_EXTRA 40
 #else
 #define BFLSC_TIMEOUT_MS 300
 #define BITFORCE_TIMEOUT_MS 200
@@ -78,8 +80,6 @@
 #define ICARUS_TIMEOUT_MS 200
 #define HASHFAST_TIMEOUT_MS 200
 #endif
-
-#define USB_READ_MINPOLL 40
 
 #define USB_EPS(_intx, _epinfosx) { \
 		.interface = _intx, \
@@ -2426,7 +2426,7 @@ usb_bulk_transfer(struct libusb_device_handle *dev_handle, int intinfo,
 #ifdef WIN32
 	/* On windows the callback_timeout is a safety mechanism only. */
 	bulk_timeout = timeout;
-	callback_timeout += timeout + cgpu->usbdev->found->timeout;
+	callback_timeout += WIN_CALLBACK_EXTRA;
 #else
 	/* We give the transfer no timeout since we manage timeouts ourself on
 	 * non windows. */
@@ -2497,7 +2497,6 @@ int _usb_read(struct cgpu_info *cgpu, int intinfo, int epinfo, char *buf, size_t
 	bool ftdi;
 	struct timeval read_start, tv_finish;
 	unsigned int initial_timeout;
-	double max, done;
 	int bufleft, err, got, tot, pstate;
 	bool first = true;
 	bool dobuffer;
@@ -2505,6 +2504,7 @@ int _usb_read(struct cgpu_info *cgpu, int intinfo, int epinfo, char *buf, size_t
 	int endlen;
 	unsigned char *ptr, *usbbuf = cgpu->usbinfo.bulkbuf;
 	const size_t usbbufread = 512; /* Always read full size */
+	double done;
 
 	DEVRLOCK(cgpu, pstate);
 
@@ -2538,7 +2538,6 @@ int _usb_read(struct cgpu_info *cgpu, int intinfo, int epinfo, char *buf, size_t
 
 		err = LIBUSB_SUCCESS;
 		initial_timeout = timeout;
-		max = ((double)timeout) / 1000.0;
 		cgtime(&read_start);
 		while (bufleft > 0) {
 			got = 0;
@@ -2576,9 +2575,7 @@ int _usb_read(struct cgpu_info *cgpu, int intinfo, int epinfo, char *buf, size_t
 			first = false;
 
 			done = tdiff(&tv_finish, &read_start);
-			// N.B. this is: return LIBUSB_SUCCESS with whatever size has already been read
-			if (unlikely(done >= max))
-				break;
+			// N.B. this is: return last err with whatever size has already been read
 			timeout = initial_timeout - (done * 1000);
 			if (timeout <= 0)
 				break;
@@ -2610,7 +2607,6 @@ int _usb_read(struct cgpu_info *cgpu, int intinfo, int epinfo, char *buf, size_t
 	endlen = strlen(end);
 	err = LIBUSB_SUCCESS;
 	initial_timeout = timeout;
-	max = ((double)timeout) / 1000.0;
 	cgtime(&read_start);
 
 	while (bufleft > 0) {
@@ -2652,8 +2648,6 @@ int _usb_read(struct cgpu_info *cgpu, int intinfo, int epinfo, char *buf, size_t
 
 		done = tdiff(&tv_finish, &read_start);
 		// N.B. this is: return LIBUSB_SUCCESS with whatever size has already been read
-		if (unlikely(done >= max))
-			break;
 		timeout = initial_timeout - (done * 1000);
 		if (timeout <= 0)
 			break;
@@ -2713,11 +2707,11 @@ out_noerrmsg:
 int _usb_write(struct cgpu_info *cgpu, int intinfo, int epinfo, char *buf, size_t bufsiz, int *processed, int timeout, enum usb_cmds cmd)
 {
 	struct cg_usb_device *usbdev;
-	struct timeval read_start, tv_finish;
+	struct timeval write_start, tv_finish;
 	unsigned int initial_timeout;
-	double max, done;
 	__maybe_unused bool first = true;
 	int err, sent, tot, pstate;
+	double done;
 
 	DEVRLOCK(cgpu, pstate);
 
@@ -2739,8 +2733,7 @@ int _usb_write(struct cgpu_info *cgpu, int intinfo, int epinfo, char *buf, size_
 	tot = 0;
 	err = LIBUSB_SUCCESS;
 	initial_timeout = timeout;
-	max = ((double)timeout) / 1000.0;
-	cgtime(&read_start);
+	cgtime(&write_start);
 	while (bufsiz > 0) {
 		int tosend = bufsiz;
 
@@ -2757,7 +2750,7 @@ int _usb_write(struct cgpu_info *cgpu, int intinfo, int epinfo, char *buf, size_
 
 		USBDEBUG("USB debug: @_usb_write(%s (nodev=%s)) err=%d%s sent=%d", cgpu->drv->name, bool_str(cgpu->usbinfo.nodev), err, isnodev(err), sent);
 
-		IOERR_CHECK(cgpu, err);
+		WRITEIOERR_CHECK(cgpu, err);
 
 		tot += sent;
 
@@ -2769,10 +2762,8 @@ int _usb_write(struct cgpu_info *cgpu, int intinfo, int epinfo, char *buf, size_
 
 		first = false;
 
-		done = tdiff(&tv_finish, &read_start);
-		// N.B. this is: return LIBUSB_SUCCESS with whatever size was written
-		if (unlikely(done >= max))
-			break;
+		done = tdiff(&tv_finish, &write_start);
+		// N.B. this is: return last err with whatever size was written
 		timeout = initial_timeout - (done * 1000);
 		if (timeout <= 0)
 			break;
@@ -2787,7 +2778,7 @@ int _usb_write(struct cgpu_info *cgpu, int intinfo, int epinfo, char *buf, size_
 			err = LIBUSB_ERROR_OTHER;
 	}
 out_noerrmsg:
-	if (NODEV(err)) {
+	if (WRITENODEV(err)) {
 		cg_ruwlock(&cgpu->usbinfo.devlock);
 		release_cgpu(cgpu);
 		DEVWUNLOCK(cgpu, pstate);
@@ -2876,7 +2867,7 @@ int __usb_transfer(struct cgpu_info *cgpu, uint8_t request_type, uint8_t bReques
 
 	USBDEBUG("USB debug: @_usb_transfer(%s (nodev=%s)) err=%d%s", cgpu->drv->name, bool_str(cgpu->usbinfo.nodev), err, isnodev(err));
 
-	IOERR_CHECK(cgpu, err);
+	WRITEIOERR_CHECK(cgpu, err);
 
 	if (err < 0 && err != LIBUSB_ERROR_TIMEOUT) {
 		applog(LOG_WARNING, "%s %i usb transfer err:(%d) %s", cgpu->drv->name, cgpu->device_id,
