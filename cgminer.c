@@ -1457,7 +1457,7 @@ static char *load_config(const char *arg, void __maybe_unused *unused);
 
 static int fileconf_load;
 
-static char *parse_config(json_t *config, bool fileconf)
+static char *parse_config(const json_t const *config, bool fileconf)
 {
 	static char err_buf[200];
 	struct opt_table *opt;
@@ -1476,7 +1476,7 @@ static char *parse_config(json_t *config, bool fileconf)
 			continue;
 
 		/* Pull apart the option name(s). */
-		name = strdup(opt->names);
+		name = (char*)jsonp_strdup(opt->names);
 		for (p = strtok(name, "|"); p; p = strtok(NULL, "|")) {
 			char *err = NULL;
 
@@ -1505,6 +1505,8 @@ static char *parse_config(json_t *config, bool fileconf)
 			else
 				err = "Invalid value";
 
+			// json_decref(val);
+
 			if (err) {
 				/* Allow invalid values to be in configuration
 				 * file, just skipping over them provided the
@@ -1525,6 +1527,8 @@ static char *parse_config(json_t *config, bool fileconf)
 	val = json_object_get(config, JSON_INCLUDE_CONF);
 	if (val && json_is_string(val))
 		return load_config(json_string_value(val), NULL);
+
+	//json_decref(val);
 
 	return NULL;
 }
@@ -1560,6 +1564,7 @@ static char *load_config(const char *arg, void __maybe_unused *unused)
 			quit(1, "Malloc failure in json error");
 
 		snprintf(json_error, siz, JSON_LOAD_ERROR, arg, err.text);
+
 		return json_error;
 	}
 
@@ -1570,7 +1575,7 @@ static char *load_config(const char *arg, void __maybe_unused *unused)
 	char *parsed_config = parse_config(config, true);
 
 	// XXX: Possible memory leak
-	json_decref(config);
+	//json_decref(config);
 
 	return parsed_config;
 }
@@ -1590,12 +1595,15 @@ static void load_default_config(void)
 
 	default_save_file(cnfbuf);
 
-	if (!access(cnfbuf, R_OK))
-		load_config(cnfbuf, NULL);
-	else {
+	if (!access(cnfbuf, R_OK)) {
+		char * conf = load_config(cnfbuf, NULL);
+		if(conf) {
+			free(conf);
+		}
+	} // else {
 		free(cnfbuf);
 		cnfbuf = NULL;
-	}
+	//}
 }
 
 extern const char *opt_argv0;
