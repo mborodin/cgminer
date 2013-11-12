@@ -1550,6 +1550,10 @@ static char *load_config(const char *arg, void __maybe_unused *unused)
 	config = json_load_file(arg, &err);
 #endif
 	if (!json_is_object(config)) {
+
+		// XXX: Possible memory leak
+		json_decref(config);
+
 		siz = JSON_LOAD_ERROR_LEN + strlen(arg) + strlen(err.text);
 		json_error = malloc(siz);
 		if (!json_error)
@@ -1563,7 +1567,12 @@ static char *load_config(const char *arg, void __maybe_unused *unused)
 
 	/* Parse the config now, so we can override it.  That can keep pointers
 	 * so don't free config object. */
-	return parse_config(config, true);
+	char *parsed_config = parse_config(config, true);
+
+	// XXX: Possible memory leak
+	json_decref(config);
+
+	return parsed_config;
 }
 
 static char *set_default_config(const char *arg)
