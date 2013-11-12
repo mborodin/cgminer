@@ -917,6 +917,7 @@ json_t *json_loads(const char *string, size_t flags, json_error_t *error)
     if(lex_init(&lex, string_get, (void *)&stream_data))
         return NULL;
 
+    // XXX: Bug trace: memory leak
     result = parse_json(&lex, flags, error);
 
     lex_close(&lex);

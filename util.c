@@ -1721,6 +1721,8 @@ static bool show_message(struct pool *pool, json_t *val)
 	return true;
 }
 
+
+// TODO: Rewrite this method: put common pieces to single place
 bool parse_method(struct pool *pool, char *s)
 {
 	json_t *val = NULL, *method, *err_val, *params;
@@ -1738,8 +1740,11 @@ bool parse_method(struct pool *pool, char *s)
 	}
 
 	method = json_object_get(val, "method");
-	if (!method)
+	if (!method) {
+		// XXX: Possible memory leak
+		json_decref(val);
 		return ret;
+	}
 	err_val = json_object_get(val, "error");
 	params = json_object_get(val, "params");
 
@@ -1753,42 +1758,74 @@ bool parse_method(struct pool *pool, char *s)
 
 		applog(LOG_INFO, "JSON-RPC method decode failed: %s", ss);
 
+		// XXX: Possible memory leak
+		json_decref(val);
+
 		free(ss);
 
 		return ret;
 	}
 
 	buf = (char *)json_string_value(method);
-	if (!buf)
+	if (!buf) {
+
+		// XXX: Possible memory leak
+		json_decref(val);
+
 		return ret;
+	}
 
 	if (!strncasecmp(buf, "mining.notify", 13)) {
 		if (parse_notify(pool, params))
 			pool->stratum_notify = ret = true;
 		else
 			pool->stratum_notify = ret = false;
+
+		// XXX: Possible memory leak
+		json_decref(val);
+
 		return ret;
 	}
 
 	if (!strncasecmp(buf, "mining.set_difficulty", 21) && parse_diff(pool, params)) {
 		ret = true;
+
+		// XXX: Possible memory leak
+		json_decref(val);
+
 		return ret;
 	}
 
 	if (!strncasecmp(buf, "client.reconnect", 16) && parse_reconnect(pool, params)) {
 		ret = true;
+
+		// XXX: Possible memory leak
+		json_decref(val);
+
 		return ret;
 	}
 
 	if (!strncasecmp(buf, "client.get_version", 18) && send_version(pool, val)) {
 		ret = true;
+
+		// XXX: Possible memory leak
+		json_decref(val);
+
 		return ret;
 	}
 
 	if (!strncasecmp(buf, "client.show_message", 19) && show_message(pool, params)) {
 		ret = true;
+
+		// XXX: Possible memory leak
+		json_decref(val);
+
 		return ret;
 	}
+
+	// XXX: Possible memory leak
+	json_decref(val);
+
 	return ret;
 }
 
@@ -1831,13 +1868,18 @@ bool auth_stratum(struct pool *pool)
 		applog(LOG_WARNING, "pool %d JSON stratum auth failed: %s", pool->pool_no, ss);
 		free(ss);
 
-		return ret;
+		goto out;
 	}
 
 	ret = true;
 	applog(LOG_INFO, "Stratum authorisation success for pool %d", pool->pool_no);
 	pool->probed = true;
 	successful_connect = true;
+
+out:
+	// XXX: Possible memory leak
+	json_decref(val);
+
 	return ret;
 }
 
@@ -2383,12 +2425,17 @@ out:
 
 			applog(LOG_DEBUG, "Failed to resume stratum, trying afresh");
 			noresume = true;
+			// XXX: Possible memory leak
+			json_decref(val);
 			goto resend;
 		}
 		applog(LOG_DEBUG, "Initiate stratum failed");
 		if (sockd)
 			suspend_stratum(pool);
 	}
+
+	// XXX: Possible memory leak
+	json_decref(val);
 
 	return ret;
 }
